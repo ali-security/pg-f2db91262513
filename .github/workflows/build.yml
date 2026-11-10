@@ -1,15 +1,18 @@
 name: Go
 
 on:
-  push:
-    branches: [master, v10, v11]
-  pull_request:
-    branches: [master, v10, v11]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'go test -run regex; empty runs the full suite'
+        required: false
+        default: ''
 
 jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       matrix:
         go-version: [1.19.x, 1.20.x, 1.21.x]
@@ -37,4 +40,66 @@ jobs:
         run: PGPASSWORD=postgres psql -U postgres -h localhost -c "CREATE EXTENSION hstore"
 
       - name: Test
-        run: make test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            TZ= PGSSLMODE=disable go test ./... -v -race -run '${{ inputs.test-filter }}'
+          else
+            make test
+          fi
+
+  module-zip:
+    name: module-zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: false
+
+      - name: Create module zip
+        env:
+          GOTOOLCHAIN: local
+          GOFLAGS: -mod=mod
+        run: |
+          HELPER=$(mktemp -d)
+          cd "$HELPER"
+          go mod init ziphelper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[3])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              mv := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              if err := zip.CreateFromDir(f, mv, os.Args[4]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          mkdir -p "$RUNNER_TEMP/out"
+          go run . github.com/go-pg/pg/v10 v10.12.0 "$RUNNER_TEMP/out/v10.12.0.zip" "$GITHUB_WORKSPACE"
+          unzip -l "$RUNNER_TEMP/out/v10.12.0.zip" | tail -3
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v10.12.0.zip
+          if-no-files-found: error
